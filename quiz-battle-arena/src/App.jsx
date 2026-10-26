@@ -15,6 +15,13 @@ const COLOR_EMOJI = {
   hidden: "❓",
 };
 
+const QUICK_REACTIONS = [
+  { emoji: "🔥", text: "Trust me! This tile is safe." },
+  { emoji: "💀", text: "You're walking into a trap!" },
+  { emoji: "🤫", text: "Keep it quiet, I know the truth." },
+  { emoji: "😂", text: "Good luck dying there!" },
+];
+
 async function request(path, options = {}) {
   const response = await fetch(`${API_URL}${path}`, {
     ...options,
@@ -44,6 +51,14 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [selectedTileId, setSelectedTileId] = useState(null);
   const [submittingTile, setSubmittingTile] = useState(false);
+
+  // Social & Deception UI states
+  const [showRules, setShowRules] = useState(false);
+  const [betrayalTarget, setBetrayalTarget] = useState("");
+  const [betrayalMessage, setBetrayalMessage] = useState("");
+  const [betrayalSuccess, setBetrayalSuccess] = useState("");
+  const [auctionBidInput, setAuctionBidInput] = useState("");
+  const [auctionSubmitted, setAuctionSubmitted] = useState(false);
 
   const myPlayer = room?.players?.find(
     (player) => player.id === playerId
@@ -86,6 +101,7 @@ export default function App() {
     setError("");
     setSelectedTileId(null);
     setSubmittingTile(false);
+    setAuctionSubmitted(false);
 
     sessionStorage.setItem("quizPlayerId", data.player_id);
     sessionStorage.setItem("quizSessionToken", data.session_token);
@@ -171,10 +187,14 @@ export default function App() {
   // ----------------------------------------------------------
 
   const refreshRoom = useCallback(async () => {
-    if (!room?.code) return;
+    if (!room?.code || !sessionToken) return;
 
     try {
-      const data = await request(`/rooms/${room.code}`);
+      const data = await request(`/rooms/${room.code}`, {
+        headers: {
+          "X-Session-Token": sessionToken,
+        },
+      });
 
       setRoom((previous) => {
         if (
@@ -187,6 +207,7 @@ export default function App() {
         ) {
           setSelectedTileId(null);
           setSubmittingTile(false);
+          setAuctionSubmitted(false);
         }
 
         return data;
@@ -196,7 +217,7 @@ export default function App() {
     } catch (err) {
       setError(err.message);
     }
-  }, [room?.code]);
+  }, [room?.code, sessionToken]);
 
   useEffect(() => {
     if (!room?.code) return;
@@ -238,7 +259,11 @@ export default function App() {
 
     async function restoreSession() {
       try {
-        const data = await request(`/rooms/${savedCode}`);
+        const data = await request(`/rooms/${savedCode}`, {
+          headers: {
+            "X-Session-Token": savedToken,
+          },
+        });
 
         if (cancelled) return;
 
@@ -333,7 +358,7 @@ export default function App() {
   }
 
   // ----------------------------------------------------------
-  // SELECT A TILE (Dynamic Arena Support)
+  // SELECT A TILE
   // ----------------------------------------------------------
 
   async function chooseTile(tileId) {
@@ -367,6 +392,71 @@ export default function App() {
   }
 
   // ----------------------------------------------------------
+  // SOCIAL ACTIONS (Reactions, Betrayal, Auction)
+  // ----------------------------------------------------------
+
+  async function sendReaction(emoji, text) {
+    if (!room || !sessionToken) return;
+    try {
+      const data = await request(`/rooms/${room.code}/floor/react`, {
+        method: "POST",
+        headers: { "X-Session-Token": sessionToken },
+        body: JSON.stringify({ emoji, text }),
+      });
+      setRoom(data.room);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function sendBetrayal(e) {
+    e.preventDefault();
+    if (!room || !sessionToken || !betrayalTarget || !betrayalMessage) return;
+    setError("");
+    setBetrayalSuccess("");
+
+    try {
+      const data = await request(`/rooms/${room.code}/floor/betray`, {
+        method: "POST",
+        headers: { "X-Session-Token": sessionToken },
+        body: JSON.stringify({
+          target_player_id: betrayalTarget,
+          message: betrayalMessage,
+        }),
+      });
+      setRoom(data.room);
+      setBetrayalMessage("");
+      setBetrayalSuccess("Secret message successfully dispatched!");
+      setTimeout(() => setBetrayalSuccess(""), 3000);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function submitAuctionBid(e) {
+    e.preventDefault();
+    if (!room || !sessionToken) return;
+    const amount = parseInt(auctionBidInput, 10);
+    if (isNaN(amount) || amount < 0) {
+      setError("Please enter a valid bid amount.");
+      return;
+    }
+    setError("");
+
+    try {
+      const data = await request(`/rooms/${room.code}/floor/auction`, {
+        method: "POST",
+        headers: { "X-Session-Token": sessionToken },
+        body: JSON.stringify({ bid_amount: amount }),
+      });
+      setRoom(data.room);
+      setAuctionSubmitted(true);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  // ----------------------------------------------------------
   // COPY INVITE
   // ----------------------------------------------------------
 
@@ -396,6 +486,7 @@ export default function App() {
     setError("");
     setSelectedTileId(null);
     setSubmittingTile(false);
+    setAuctionSubmitted(false);
 
     sessionStorage.removeItem("quizPlayerId");
     sessionStorage.removeItem("quizSessionToken");
@@ -416,8 +507,46 @@ export default function App() {
           DON'T TRUST THE FLOOR
         </div>
 
-        <span className="nav-tag">MULTIPLAYER PARTY GAME</span>
+        <button
+          className="secondary-button rules-toggle-btn"
+          onClick={() => setShowRules(true)}
+          style={{ padding: "8px 12px", fontSize: "11px" }}
+        >
+          📜 How to Play & Rules
+        </button>
       </nav>
+
+      {/* RULES MODAL */}
+      {showRules && (
+        <div className="rules-modal-overlay">
+          <div className="rules-modal">
+            <h2>📜 Game Rules & Deception Mechanics</h2>
+            <div className="rules-content">
+              <h3>1. The Core Objective</h3>
+              <p>Survive 10 grueling rounds across a dynamic grid of tiles. Correct safe tiles reward points (+100 or more), while dangerous tiles or traps penalize your score (-25).</p>
+              
+              <h3>2. Bluffing & False Announcements</h3>
+              <p>The game announces clues like <em>“BLUE looks safe.”</em> But beware! Announcements can be completely false or trap-laden. Use quick reactions to mislead or reassure your rivals.</p>
+
+              <h3>3. The Secret Informant</h3>
+              <p>Each round, one random player secretly receives a private mission or clue. Complete your secret objective or use the knowledge to manipulate the room without anyone knowing!</p>
+
+              <h3>4. The Betrayal Button</h3>
+              <p>Once per match, every player can send a fake private warning to a specific opponent (e.g., <em>“RED is definitely safe.”</em>). If they fall for it and fail, you steal bonus points!</p>
+
+              <h3>5. Fragmented Clues & Final Truth Auction</h3>
+              <p>Nobody gets the whole truth—every player receives a different clue fragment. In the final round, bid your hard-earned points to buy the exact safe coordinate in a high-stakes blind auction!</p>
+            </div>
+            <button
+              className="primary-button"
+              onClick={() => setShowRules(false)}
+              style={{ marginTop: "20px" }}
+            >
+              Got it, let's play!
+            </button>
+          </div>
+        </div>
+      )}
 
       {!room ? (
         <main className="hero">
@@ -432,9 +561,8 @@ export default function App() {
           </h1>
 
           <p className="hero-description">
-            Four colors. Hidden danger. One wrong move can
-            change everything. Challenge your friends in a
-            multiplayer survival showdown.
+            Four colors. Hidden danger. Deception, secret missions,
+            and backstabbing await in this multiplayer survival showdown.
           </p>
 
           <section className="game-card">
@@ -487,7 +615,7 @@ export default function App() {
 
           <div className="feature-row">
             <span>👥 2–4 players</span>
-            <span>🎨 Dynamic arena grids</span>
+            <span>🕵️ Secret Informants & Betrayals</span>
             <span>⚡ 10 suspenseful rounds</span>
           </div>
 
@@ -622,11 +750,9 @@ export default function App() {
                 )}
 
                 <div className="rules-preview">
-                  <h3>How to survive</h3>
-                  <p>🎨 Select a tile on the dynamic arena.</p>
-                  <p>⏱ You have 15 seconds to commit.</p>
-                  <p>🎭 Watch out for dynamic events & traps.</p>
-                  <p>🏆 Safe tiles score +100. Danger costs 25.</p>
+                  <h3>Social Deception Active</h3>
+                  <p>🕵️ Secret missions & private information fragments assigned every round.</p>
+                  <p>🗡️ One-time Betrayal Button available to send fake messages.</p>
                 </div>
               </section>
             </>
@@ -661,11 +787,114 @@ export default function App() {
                 )}
               </div>
 
-              {/* Event banner if available */}
+              {/* Event banner */}
               {floorGame.event && (
-                <div className="event-banner" style={{ marginBottom: "1rem", padding: "0.5rem 1rem", background: "rgba(255,255,255,0.05)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)" }}>
-                  <span style={{ fontSize: "0.8rem", color: "#a0aec0", display: "block" }}>EVENT: {floorGame.event.name.toUpperCase()}</span>
-                  <span style={{ fontSize: "0.95kt", fontWeight: "600" }}>{floorGame.event.description}</span>
+                <div className="event-banner" style={{ margin: "1rem 0", padding: "0.6rem 1rem", background: "rgba(255,255,255,0.05)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)" }}>
+                  <span style={{ fontSize: "0.75rem", color: "#a0aec0", display: "block" }}>EVENT: {floorGame.event.name.toUpperCase()}</span>
+                  <span style={{ fontSize: "0.9rem", fontWeight: "600" }}>{floorGame.event.description}</span>
+                </div>
+              )}
+
+              {/* PRIVATE ROLES & CLUES PANEL */}
+              <div className="private-info-panel" style={{ margin: "1rem 0", padding: "12px", background: "rgba(149, 107, 255, 0.08)", borderRadius: "10px", border: "1px solid rgba(149, 107, 255, 0.2)" }}>
+                <h4 style={{ margin: "0 0 6px 0", fontSize: "11px", color: "#c4b5fd", letterSpacing: "1px" }}>🔒 PRIVATE INTEL & FRAGMENT</h4>
+                <p style={{ margin: "4px 0", fontSize: "12px" }}><strong>Clue Fragment:</strong> {floorGame.my_fragment || "None received."}</p>
+                {floorGame.secret_mission && (
+                  <p style={{ margin: "4px 0", fontSize: "12px", color: "#ffd166" }}><strong>🕵️ Secret Mission:</strong> {floorGame.secret_mission}</p>
+                )}
+                {floorGame.auction_hint && (
+                  <p style={{ margin: "4px 0", fontSize: "12px", color: "#5ee6a8" }}><strong>💎 Auction Hint:</strong> {floorGame.auction_hint}</p>
+                )}
+              </div>
+
+              {/* INBOX (Anonymous Betrayal Warnings) */}
+              {floorGame.inbox && floorGame.inbox.length > 0 && (
+                <div className="inbox-panel" style={{ margin: "1rem 0", padding: "10px", background: "rgba(255, 119, 127, 0.1)", borderRadius: "8px", border: "1px solid rgba(255, 119, 127, 0.3)" }}>
+                  <h4 style={{ margin: "0 0 4px 0", fontSize: "11px", color: "#ff777f" }}>📥 ANONYMOUS WARNING INBOX</h4>
+                  {floorGame.inbox.map((msg, idx) => (
+                    <p key={idx} style={{ margin: "4px 0", fontSize: "12px" }}>💬 <em>"{msg.message}"</em></p>
+                  ))}
+                </div>
+              )}
+
+              {/* QUICK REACTIONS CHAT */}
+              {floorGame.phase === "choosing" && (
+                <div className="reactions-container" style={{ margin: "1rem 0" }}>
+                  <div style={{ fontSize: "10px", color: "#aaa7bb", marginBottom: "6px", fontWeight: "700" }}>SEND QUICK REACTION / BLUFF:</div>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    {QUICK_REACTIONS.map((item, idx) => (
+                      <button
+                        key={idx}
+                        className="secondary-button"
+                        style={{ fontSize: "11px", padding: "6px 10px" }}
+                        onClick={() => sendReaction(item.emoji, item.text)}
+                      >
+                        {item.emoji} {item.text}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Public Live Feed */}
+                  {floorGame.reactions && floorGame.reactions.length > 0 && (
+                    <div style={{ marginTop: "10px", maxHeight: "80px", overflowY: "auto", background: "rgba(0,0,0,0.3)", padding: "8px", borderRadius: "6px" }}>
+                      {floorGame.reactions.slice(-3).map((r, i) => (
+                        <div key={i} style={{ fontSize: "11px", margin: "2px 0", color: "#e2e8f0" }}>
+                          <strong>{r.nickname}:</strong> {r.emoji} {r.text}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* BETRAYAL BUTTON WIDGET */}
+              {floorGame.phase === "choosing" && myPlayer && !myPlayer.has_used_betrayal && (
+                <div className="betrayal-widget" style={{ margin: "1rem 0", padding: "12px", background: "rgba(255,255,255,0.03)", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.1)" }}>
+                  <h4 style={{ margin: "0 0 8px 0", fontSize: "11px", color: "#ff777f" }}>🗡️ THE BETRAYAL BUTTON (1-Use per match)</h4>
+                  <form onSubmit={sendBetrayal} style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    <select
+                      value={betrayalTarget}
+                      onChange={(e) => setBetrayalTarget(e.target.value)}
+                      style={{ background: "#09090f", color: "#fff", border: "1px solid rgba(255,255,255,0.2)", padding: "6px", borderRadius: "6px", fontSize: "11px" }}
+                    >
+                      <option value="">Select Target Opponent</option>
+                      {room.players.filter(p => p.id !== playerId).map(p => (
+                        <option key={p.id} value={p.id}>{p.nickname}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      placeholder="e.g. RED is completely safe!"
+                      value={betrayalMessage}
+                      onChange={(e) => setBetrayalMessage(e.target.value)}
+                      maxLength={100}
+                      style={{ flex: 1, minWidth: "150px", background: "#09090f", color: "#fff", border: "1px solid rgba(255,255,255,0.2)", padding: "6px 10px", borderRadius: "6px", fontSize: "11px" }}
+                    />
+                    <button type="submit" className="secondary-button" style={{ borderColor: "#ff777f", color: "#ff777f", fontSize: "11px" }}>Send Bluff</button>
+                  </form>
+                  {betrayalSuccess && <p style={{ color: "#5ee6a8", fontSize: "11px", margin: "4px 0 0 0" }}>{betrayalSuccess}</p>}
+                </div>
+              )}
+
+              {/* FINAL ROUND TRUTH AUCTION */}
+              {floorGame.is_final_round && floorGame.phase === "choosing" && (
+                <div className="auction-widget" style={{ margin: "1rem 0", padding: "14px", background: "rgba(255, 209, 102, 0.08)", borderRadius: "10px", border: "1px solid rgba(255, 209, 102, 0.3)" }}>
+                  <h4 style={{ margin: "0 0 6px 0", fontSize: "12px", color: "#ffd166" }}>💎 FINAL ROUND TRUTH AUCTION</h4>
+                  <p style={{ margin: "0 0 8px 0", fontSize: "11px", color: "#aaa7bb" }}>Bid points to buy the exact safe coordinate hint. Highest bidder wins the intel!</p>
+                  {!auctionSubmitted ? (
+                    <form onSubmit={submitAuctionBid} style={{ display: "flex", gap: "8px" }}>
+                      <input
+                        type="number"
+                        placeholder="Bid points"
+                        value={auctionBidInput}
+                        onChange={(e) => setAuctionBidInput(e.target.value)}
+                        style={{ width: "120px", background: "#09090f", color: "#fff", border: "1px solid rgba(255,255,255,0.2)", padding: "6px 10px", borderRadius: "6px", fontSize: "11px" }}
+                      />
+                      <button type="submit" className="secondary-button" style={{ borderColor: "#ffd166", color: "#ffd166", fontSize: "11px" }}>Place Bid</button>
+                    </form>
+                  ) : (
+                    <p style={{ color: "#ffd166", fontSize: "12px", margin: "0" }}>Bid submitted successfully! Awaiting round resolution...</p>
+                  )}
                 </div>
               )}
 
@@ -696,7 +925,7 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* Dynamic Grid Rendering based on arena grid_size */}
+                  {/* Dynamic Grid Rendering */}
                   <div
                     className="tile-grid dynamic-grid"
                     style={{
