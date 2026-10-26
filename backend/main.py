@@ -8,7 +8,8 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Quiz Battle Arena API")
+
+app = FastAPI(title="DON'T TRUST THE FLOOR API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,10 +23,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 MAX_PLAYERS = 4
+
+# Original quiz settings
 QUESTION_TIME = 15
 TOTAL_QUESTIONS = 10
+
+# DON'T TRUST THE FLOOR settings
+FLOOR_COLORS = ["green", "blue", "red", "yellow"]
+FLOOR_ROUNDS = 10
+FLOOR_DECISION_TIME = 15
+FLOOR_REVEAL_TIME = 4
+FLOOR_SAFE_POINTS = 100
+FLOOR_DANGER_PENALTY = 25
+FLOOR_TRAP_CHANCE = 30
+
 rooms = {}
+
+
+# ============================================================
+# ORIGINAL QUIZ QUESTIONS
+# Preserved so the existing quiz endpoints still work.
+# ============================================================
 
 QUESTIONS = [
     {
@@ -58,7 +81,7 @@ QUESTIONS = [
         "explanation": "SQL stands for Structured Query Language.",
     },
     {
-        "question": "Which component is responsible for executing instructions in a computer?",
+        "question": "Which component executes instructions in a computer?",
         "options": ["Monitor", "CPU", "Keyboard", "Printer"],
         "correct": 1,
         "explanation": "The CPU executes program instructions.",
@@ -101,6 +124,10 @@ QUESTIONS = [
 ]
 
 
+# ============================================================
+# REQUEST MODELS
+# ============================================================
+
 class NicknameRequest(BaseModel):
     nickname: str = Field(min_length=1, max_length=20)
 
@@ -113,27 +140,188 @@ class AnswerRequest(BaseModel):
     answer_index: int = Field(ge=0, le=3)
 
 
+class FloorChoiceRequest(BaseModel):
+    tile_color: str
+
+
+# ============================================================
+# COMMON HELPERS
+# ============================================================
+
 def clean_nickname(nickname: str) -> str:
     nickname = " ".join(nickname.split()).strip()
+
     if not nickname:
-        raise HTTPException(status_code=400, detail="Enter a nickname.")
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a nickname.",
+        )
+
     return nickname[:20]
 
 
 def generate_room_code() -> str:
     characters = string.ascii_uppercase + string.digits
+
     while True:
-        code = "".join(secrets.choice(characters) for _ in range(6))
+        code = "".join(
+            secrets.choice(characters) for _ in range(6)
+        )
+
         if code not in rooms:
             return code
 
 
-def advance_game_if_needed(room: dict) -> None:
+def get_room_or_404(code: str) -> dict:
+    room = rooms.get(code.strip().upper())
+
+    if not room:
+        raise HTTPException(
+            status_code=404,
+            detail="Room not found.",
+        )
+
+    advance_game_if_needed(room)
+    return room
+
+
+def authenticate_player(
+    room: dict,
+    session_token: str | None,
+) -> dict:
+    if not session_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Session token missing.",
+        )
+
+    for player in room["players"]:
+        if secrets.compare_digest(
+            player["session_token"],
+            session_token,
+        ):
+            return player
+
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid session token.",
+    )
+
+
+# ============================================================
+# DON'T TRUST THE FLOOR: ROUND ENGINE
+# ============================================================
+
+def create_floor_round() -> dict:
+    announced_color = secrets.choice(FLOOR_COLORS)
+
+    # 30% of announcements are misleading.
+    is_trap = secrets.randbelow(100) < FLOOR_TRAP_CHANCE
+
+    if is_trap:
+        safe_color = secrets.choice([
+            color
+            for color in FLOOR_COLORS
+            if color != announced_color
+        ])
+    else:
+        safe_color = announced_color
+
+    return {
+        "announcement": f"{announced_color.upper()} IS SAFE!",
+        "announced_color": announced_color,
+        "safe_color": safe_color,
+        "is_trap": is_trap,
+    }
+
+
+def resolve_floor_round(room: dict) -> None:
+    game = room["floor_game"]
+
+    if game["phase"] != "choosing":
+        return
+
+    round_data = game["rounds"][game["round_index"]]
+    results = []
+
+    for player in room["players"]:
+        chosen_color = game["choices"].get(player["id"])
+
+        if chosen_color is None:
+            outcome = "timeout"
+            points = 0
+
+        elif chosen_color == round_data["safe_color"]:
+            outcome = "safe"
+            points = FLOOR_SAFE_POINTS
+            player["score"] += points
+
+        else:
+            outcome = "danger"
+            points = -FLOOR_DANGER_PENALTY
+            player["score"] += points
+
+        results.append({
+            "player_id": player["id"],
+            "nickname": player["nickname"],
+            "tile_color": chosen_color,
+            "outcome": outcome,
+            "points_earned": points,
+            "total_score": player["score"],
+        })
+
+    game["results"] = results
+    game["phase"] = "reveal"
+    game["phase_started_at"] = time.time()
+
+
+def advance_floor_game_if_needed(room: dict) -> None:
+    game = room.get("floor_game")
+
+    if not game or room["status"] != "playing":
+        return
+
+    now = time.time()
+
+    if game["phase"] == "choosing":
+        elapsed = now - game["phase_started_at"]
+
+        everyone_chose = (
+            len(game["choices"]) >= len(room["players"])
+        )
+
+        if everyone_chose or elapsed >= FLOOR_DECISION_TIME:
+            resolve_floor_round(room)
+
+    elif game["phase"] == "reveal":
+        elapsed = now - game["phase_started_at"]
+
+        if elapsed >= FLOOR_REVEAL_TIME:
+            next_index = game["round_index"] + 1
+
+            if next_index >= FLOOR_ROUNDS:
+                room["status"] = "completed"
+                return
+
+            game["round_index"] = next_index
+            game["phase"] = "choosing"
+            game["phase_started_at"] = now
+            game["choices"] = {}
+            game["results"] = []
+
+
+# ============================================================
+# ORIGINAL QUIZ ENGINE
+# ============================================================
+
+def advance_quiz_if_needed(room: dict) -> None:
     if room["status"] != "playing":
         return
 
     elapsed = time.time() - room["question_started_at"]
-    all_answered = len(room["answers"]) >= len(room["players"])
+    all_answered = (
+        len(room["answers"]) >= len(room["players"])
+    )
 
     if elapsed >= QUESTION_TIME or all_answered:
         next_index = room["question_index"] + 1
@@ -141,24 +329,38 @@ def advance_game_if_needed(room: dict) -> None:
         if next_index >= len(room["questions"]):
             room["status"] = "completed"
             room["answers"] = {}
+
         else:
             room["question_index"] = next_index
             room["question_started_at"] = time.time()
             room["answers"] = {}
 
 
+def advance_game_if_needed(room: dict) -> None:
+    if room.get("game_mode") == "floor":
+        advance_floor_game_if_needed(room)
+    else:
+        advance_quiz_if_needed(room)
+
+
+# ============================================================
+# PUBLIC ROOM STATE
+# Never expose session tokens or hidden safe colors.
+# ============================================================
+
 def public_room_state(room: dict) -> dict:
     advance_game_if_needed(room)
 
-    players = []
-    for player in room["players"]:
-        players.append({
+    players = [
+        {
             "id": player["id"],
             "nickname": player["nickname"],
             "is_host": player["is_host"],
             "ready": player["ready"],
             "score": player["score"],
-        })
+        }
+        for player in room["players"]
+    ]
 
     result = {
         "code": room["code"],
@@ -166,65 +368,115 @@ def public_room_state(room: dict) -> dict:
         "status": room["status"],
         "created_at": room["created_at"],
         "players": players,
+        "game_mode": room.get("game_mode", "quiz"),
     }
 
-    if room["status"] in ("playing", "completed"):
+    if room.get("game_mode") == "floor":
+        game = room["floor_game"]
+
+        result["question_number"] = game["round_index"] + 1
+        result["total_questions"] = FLOOR_ROUNDS
+
+        if room["status"] == "playing":
+            round_data = game["rounds"][game["round_index"]]
+
+            floor_state = {
+                "round_number": game["round_index"] + 1,
+                "total_rounds": FLOOR_ROUNDS,
+                "phase": game["phase"],
+                "time_limit": FLOOR_DECISION_TIME,
+                "remaining_seconds": (
+                    max(
+                        0,
+                        FLOOR_DECISION_TIME
+                        - int(time.time() - game["phase_started_at"]),
+                    )
+                    if game["phase"] == "choosing"
+                    else 0
+                ),
+                "announcement": round_data["announcement"],
+                "tiles": FLOOR_COLORS,
+                "selected_player_ids": list(
+                    game["choices"].keys()
+                ),
+            }
+
+            # Hidden answers are revealed only during the reveal phase.
+            if game["phase"] == "reveal":
+                floor_state["safe_color"] = round_data["safe_color"]
+                floor_state["is_trap"] = round_data["is_trap"]
+                floor_state["results"] = game["results"]
+
+            result["floor_game"] = floor_state
+
+        elif room["status"] == "completed":
+            result["total_rounds"] = FLOOR_ROUNDS
+            result["final_results"] = sorted(
+                players,
+                key=lambda player: player["score"],
+                reverse=True,
+            )
+
+    elif room["status"] in ("playing", "completed"):
         result["question_number"] = min(
-            room["question_index"] + 1, len(room["questions"])
+            room["question_index"] + 1,
+            len(room["questions"]),
         )
         result["total_questions"] = len(room["questions"])
 
-    if room["status"] == "playing":
-        question = room["questions"][room["question_index"]]
-        remaining = max(
-            0,
-            QUESTION_TIME - int(time.time() - room["question_started_at"]),
-        )
+        if room["status"] == "playing":
+            question = room["questions"][room["question_index"]]
 
-        result["question"] = {
-            "text": question["question"],
-            "options": question["options"],
-            "time_limit": QUESTION_TIME,
-            "remaining_seconds": remaining,
-        }
-        result["answered_player_ids"] = list(room["answers"].keys())
+            remaining = max(
+                0,
+                QUESTION_TIME - int(
+                    time.time() - room["question_started_at"]
+                ),
+            )
+
+            result["question"] = {
+                "text": question["question"],
+                "options": question["options"],
+                "time_limit": QUESTION_TIME,
+                "remaining_seconds": remaining,
+            }
+
+            result["answered_player_ids"] = list(
+                room["answers"].keys()
+            )
 
     if room["status"] == "completed":
         result["final_results"] = sorted(
-            players, key=lambda player: player["score"], reverse=True
+            players,
+            key=lambda player: player["score"],
+            reverse=True,
         )
 
     return result
 
 
-def get_room_or_404(code: str) -> dict:
-    room = rooms.get(code.strip().upper())
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found.")
-    advance_game_if_needed(room)
-    return room
-
-
-def authenticate_player(room: dict, session_token: str | None) -> dict:
-    if not session_token:
-        raise HTTPException(status_code=401, detail="Session token missing.")
-
-    for player in room["players"]:
-        if secrets.compare_digest(player["session_token"], session_token):
-            return player
-
-    raise HTTPException(status_code=401, detail="Invalid session token.")
-
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/")
 def home():
-    return {"message": "Quiz Battle Arena API is running!"}
+    return {
+        "message": "DON'T TRUST THE FLOOR API is running!"
+    }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "rooms": len(rooms)}
+    return {
+        "status": "ok",
+        "rooms": len(rooms),
+    }
 
+
+# ============================================================
+# CREATE ROOM
+# ============================================================
 
 @app.post("/rooms")
 def create_room(request: NicknameRequest):
@@ -246,13 +498,20 @@ def create_room(request: NicknameRequest):
         "status": "lobby",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "players": [host],
+
+        # Original quiz state
+        "game_mode": "quiz",
         "questions": [],
         "question_index": 0,
         "question_started_at": 0,
         "answers": {},
+
+        # Tile game state
+        "floor_game": None,
     }
 
     rooms[code] = room
+
     return {
         "room": public_room_state(room),
         "player_id": host["id"],
@@ -260,14 +519,25 @@ def create_room(request: NicknameRequest):
     }
 
 
+# ============================================================
+# JOIN ROOM
+# ============================================================
+
 @app.post("/rooms/{code}/join")
 def join_room(code: str, request: NicknameRequest):
     room = get_room_or_404(code)
 
     if room["status"] != "lobby":
-        raise HTTPException(status_code=400, detail="Game already started.")
+        raise HTTPException(
+            status_code=400,
+            detail="Game already started.",
+        )
+
     if len(room["players"]) >= MAX_PLAYERS:
-        raise HTTPException(status_code=400, detail="Room is full.")
+        raise HTTPException(
+            status_code=400,
+            detail="Room is full.",
+        )
 
     player = {
         "id": secrets.token_urlsafe(8),
@@ -277,6 +547,7 @@ def join_room(code: str, request: NicknameRequest):
         "score": 0,
         "session_token": secrets.token_urlsafe(32),
     }
+
     room["players"].append(player)
 
     return {
@@ -286,10 +557,18 @@ def join_room(code: str, request: NicknameRequest):
     }
 
 
+# ============================================================
+# GET ROOM
+# ============================================================
+
 @app.get("/rooms/{code}")
 def get_room(code: str):
     return public_room_state(get_room_or_404(code))
 
+
+# ============================================================
+# READY STATUS
+# ============================================================
 
 @app.patch("/rooms/{code}/ready")
 def set_ready(
@@ -301,11 +580,22 @@ def set_ready(
     player = authenticate_player(room, x_session_token)
 
     if room["status"] != "lobby":
-        raise HTTPException(status_code=400, detail="Game already started.")
+        raise HTTPException(
+            status_code=400,
+            detail="Game already started.",
+        )
 
     player["ready"] = request.ready
-    return {"message": "Ready status updated.", "room": public_room_state(room)}
 
+    return {
+        "message": "Ready status updated.",
+        "room": public_room_state(room),
+    }
+
+
+# ============================================================
+# ORIGINAL QUIZ START
+# ============================================================
 
 @app.post("/rooms/{code}/start")
 def start_game(
@@ -316,28 +606,54 @@ def start_game(
     player = authenticate_player(room, x_session_token)
 
     if player["id"] != room["host_id"]:
-        raise HTTPException(status_code=403, detail="Only the host can start.")
+        raise HTTPException(
+            status_code=403,
+            detail="Only the host can start.",
+        )
+
     if room["status"] != "lobby":
-        raise HTTPException(status_code=400, detail="Game already started.")
+        raise HTTPException(
+            status_code=400,
+            detail="Game already started.",
+        )
+
     if len(room["players"]) < 2:
-        raise HTTPException(status_code=400, detail="Need at least 2 players.")
+        raise HTTPException(
+            status_code=400,
+            detail="Need at least 2 players.",
+        )
+
     if not all(p["ready"] for p in room["players"]):
-        raise HTTPException(status_code=400, detail="Everyone must be ready.")
+        raise HTTPException(
+            status_code=400,
+            detail="Everyone must be ready.",
+        )
 
     room["questions"] = secrets.SystemRandom().sample(
-        QUESTIONS, k=min(TOTAL_QUESTIONS, len(QUESTIONS))
+        QUESTIONS,
+        k=min(TOTAL_QUESTIONS, len(QUESTIONS)),
     )
+
     room["question_index"] = 0
     room["question_started_at"] = time.time()
     room["answers"] = {}
+    room["game_mode"] = "quiz"
+    room["floor_game"] = None
 
     for p in room["players"]:
         p["score"] = 0
 
     room["status"] = "playing"
 
-    return {"message": "Game started!", "room": public_room_state(room)}
+    return {
+        "message": "Game started!",
+        "room": public_room_state(room),
+    }
 
+
+# ============================================================
+# ORIGINAL QUIZ ANSWER
+# ============================================================
 
 @app.post("/rooms/{code}/answer")
 def submit_answer(
@@ -348,22 +664,39 @@ def submit_answer(
     room = get_room_or_404(code)
     player = authenticate_player(room, x_session_token)
 
+    if room.get("game_mode") == "floor":
+        raise HTTPException(
+            status_code=400,
+            detail="This room is playing DON'T TRUST THE FLOOR.",
+        )
+
     if room["status"] != "playing":
-        raise HTTPException(status_code=400, detail="No active question.")
+        raise HTTPException(
+            status_code=400,
+            detail="No active question.",
+        )
 
     if player["id"] in room["answers"]:
-        raise HTTPException(status_code=409, detail="Already answered this question.")
+        raise HTTPException(
+            status_code=409,
+            detail="Already answered this question.",
+        )
 
     question = room["questions"][room["question_index"]]
     elapsed = time.time() - room["question_started_at"]
 
     if elapsed >= QUESTION_TIME:
         advance_game_if_needed(room)
-        raise HTTPException(status_code=400, detail="Time is up.")
+
+        raise HTTPException(
+            status_code=400,
+            detail="Time is up.",
+        )
 
     correct = request.answer_index == question["correct"]
 
     points = 0
+
     if correct:
         points = max(
             500,
@@ -377,12 +710,153 @@ def submit_answer(
         "points": points,
     }
 
-    # Advance immediately when everyone has answered.
     advance_game_if_needed(room)
 
     return {
         "message": "Answer submitted.",
         "correct": correct,
         "points_earned": points,
+        "room": public_room_state(room),
+    }
+
+
+# ============================================================
+# DON'T TRUST THE FLOOR: START GAME
+# ============================================================
+
+@app.post("/rooms/{code}/floor/start")
+def start_floor_game(
+    code: str,
+    x_session_token: str | None = Header(default=None),
+):
+    room = get_room_or_404(code)
+    player = authenticate_player(room, x_session_token)
+
+    if player["id"] != room["host_id"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the host can start.",
+        )
+
+    if room["status"] != "lobby":
+        raise HTTPException(
+            status_code=400,
+            detail="Game already started.",
+        )
+
+    if len(room["players"]) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Need at least 2 players.",
+        )
+
+    if not all(p["ready"] for p in room["players"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Everyone must be ready.",
+        )
+
+    for p in room["players"]:
+        p["score"] = 0
+
+    room["game_mode"] = "floor"
+    room["questions"] = []
+    room["question_index"] = 0
+    room["question_started_at"] = 0
+    room["answers"] = {}
+
+    room["floor_game"] = {
+        "rounds": [
+            create_floor_round()
+            for _ in range(FLOOR_ROUNDS)
+        ],
+        "round_index": 0,
+        "phase": "choosing",
+        "phase_started_at": time.time(),
+        "choices": {},
+        "results": [],
+    }
+
+    room["status"] = "playing"
+
+    return {
+        "message": "DON'T TRUST THE FLOOR has started!",
+        "room": public_room_state(room),
+    }
+
+
+# ============================================================
+# DON'T TRUST THE FLOOR: SELECT A TILE
+# ============================================================
+
+@app.post("/rooms/{code}/floor/choose")
+def choose_floor_tile(
+    code: str,
+    request: FloorChoiceRequest,
+    x_session_token: str | None = Header(default=None),
+):
+    room = get_room_or_404(code)
+    player = authenticate_player(room, x_session_token)
+
+    if room.get("game_mode") != "floor":
+        raise HTTPException(
+            status_code=400,
+            detail="This room is not playing DON'T TRUST THE FLOOR.",
+        )
+
+    if room["status"] != "playing":
+        raise HTTPException(
+            status_code=400,
+            detail="The game is not active.",
+        )
+
+    game = room["floor_game"]
+
+    # Advance expired phases before accepting a choice.
+    advance_floor_game_if_needed(room)
+
+    if room["status"] != "playing":
+        raise HTTPException(
+            status_code=400,
+            detail="The game has ended.",
+        )
+
+    if game["phase"] != "choosing":
+        raise HTTPException(
+            status_code=400,
+            detail="The reveal has already started.",
+        )
+
+    tile_color = request.tile_color.strip().lower()
+
+    if tile_color not in FLOOR_COLORS:
+        raise HTTPException(
+            status_code=422,
+            detail="Choose a valid tile color.",
+        )
+
+    if player["id"] in game["choices"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Your tile is already locked in.",
+        )
+
+    if (
+        time.time() - game["phase_started_at"]
+        >= FLOOR_DECISION_TIME
+    ):
+        advance_floor_game_if_needed(room)
+
+        raise HTTPException(
+            status_code=400,
+            detail="Time is up. Wait for the reveal.",
+        )
+
+    game["choices"][player["id"]] = tile_color
+
+    advance_floor_game_if_needed(room)
+
+    return {
+        "message": "Tile locked in!",
         "room": public_room_state(room),
     }
