@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useState } from "react";
 import "./App.css";
 
@@ -13,6 +12,7 @@ const COLOR_EMOJI = {
   blue: "🔵",
   red: "🔴",
   yellow: "🟡",
+  hidden: "❓",
 };
 
 async function request(path, options = {}) {
@@ -42,7 +42,7 @@ export default function App() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [selectedTile, setSelectedTile] = useState(null);
+  const [selectedTileId, setSelectedTileId] = useState(null);
   const [submittingTile, setSubmittingTile] = useState(false);
 
   const myPlayer = room?.players?.find(
@@ -71,7 +71,7 @@ export default function App() {
     isFloorGame &&
     floorGame?.phase === "choosing" &&
     !alreadySelected &&
-    selectedTile === null &&
+    selectedTileId === null &&
     !submittingTile;
 
   // ----------------------------------------------------------
@@ -84,7 +84,7 @@ export default function App() {
     setSessionToken(data.session_token);
     setRoomCode(data.room.code);
     setError("");
-    setSelectedTile(null);
+    setSelectedTileId(null);
     setSubmittingTile(false);
 
     sessionStorage.setItem("quizPlayerId", data.player_id);
@@ -185,7 +185,7 @@ export default function App() {
           previous?.floor_game?.phase !==
             data.floor_game?.phase
         ) {
-          setSelectedTile(null);
+          setSelectedTileId(null);
           setSubmittingTile(false);
         }
 
@@ -323,7 +323,7 @@ export default function App() {
       );
 
       setRoom(data.room);
-      setSelectedTile(null);
+      setSelectedTileId(null);
       setSubmittingTile(false);
     } catch (err) {
       setError(err.message);
@@ -333,13 +333,13 @@ export default function App() {
   }
 
   // ----------------------------------------------------------
-  // SELECT A TILE
+  // SELECT A TILE (Dynamic Arena Support)
   // ----------------------------------------------------------
 
-  async function chooseTile(color) {
+  async function chooseTile(tileId) {
     if (!canChooseTile || !room || !sessionToken) return;
 
-    setSelectedTile(color);
+    setSelectedTileId(tileId);
     setSubmittingTile(true);
     setError("");
 
@@ -352,14 +352,14 @@ export default function App() {
             "X-Session-Token": sessionToken,
           },
           body: JSON.stringify({
-            tile_color: color,
+            tile_id: tileId,
           }),
         }
       );
 
       setRoom(data.room);
     } catch (err) {
-      setSelectedTile(null);
+      setSelectedTileId(null);
       setError(err.message);
     } finally {
       setSubmittingTile(false);
@@ -394,7 +394,7 @@ export default function App() {
     setPlayerId("");
     setSessionToken("");
     setError("");
-    setSelectedTile(null);
+    setSelectedTileId(null);
     setSubmittingTile(false);
 
     sessionStorage.removeItem("quizPlayerId");
@@ -487,7 +487,7 @@ export default function App() {
 
           <div className="feature-row">
             <span>👥 2–4 players</span>
-            <span>🎨 Four colored tiles</span>
+            <span>🎨 Dynamic arena grids</span>
             <span>⚡ 10 suspenseful rounds</span>
           </div>
 
@@ -534,7 +534,7 @@ export default function App() {
                 </h1>
 
                 <p>
-                  Invite your friends. Pick your colors. Survive the floor.
+                  Invite your friends. Pick your tiles. Survive the floor.
                 </p>
               </div>
 
@@ -623,9 +623,9 @@ export default function App() {
 
                 <div className="rules-preview">
                   <h3>How to survive</h3>
-                  <p>🎨 Pick one of four colored tiles.</p>
+                  <p>🎨 Select a tile on the dynamic arena.</p>
                   <p>⏱ You have 15 seconds to commit.</p>
-                  <p>🎭 Some announcements are traps.</p>
+                  <p>🎭 Watch out for dynamic events & traps.</p>
                   <p>🏆 Safe tiles score +100. Danger costs 25.</p>
                 </div>
               </section>
@@ -661,6 +661,14 @@ export default function App() {
                 )}
               </div>
 
+              {/* Event banner if available */}
+              {floorGame.event && (
+                <div className="event-banner" style={{ marginBottom: "1rem", padding: "0.5rem 1rem", background: "rgba(255,255,255,0.05)", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.1)" }}>
+                  <span style={{ fontSize: "0.8rem", color: "#a0aec0", display: "block" }}>EVENT: {floorGame.event.name.toUpperCase()}</span>
+                  <span style={{ fontSize: "0.95kt", fontWeight: "600" }}>{floorGame.event.description}</span>
+                </div>
+              )}
+
               <div className="timer-track">
                 <div
                   className="timer-fill"
@@ -688,40 +696,55 @@ export default function App() {
                     </p>
                   </div>
 
-                  <div className="tile-grid">
-                    {floorGame.tiles.map((color) => (
-                      <button
-                        key={color}
-                        className={`floor-tile floor-${color} ${
-                          selectedTile === color ? "tile-selected" : ""
-                        }`}
-                        onClick={() => chooseTile(color)}
-                        disabled={!canChooseTile}
-                        aria-label={`Choose ${color} tile`}
-                      >
-                        <span className="tile-emoji">
-                          {COLOR_EMOJI[color]}
-                        </span>
+                  {/* Dynamic Grid Rendering based on arena grid_size */}
+                  <div
+                    className="tile-grid dynamic-grid"
+                    style={{
+                      gridTemplateColumns: `repeat(${floorGame.arena?.grid_size || 3}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {floorGame.arena?.tiles.map((tile) => {
+                      const isSelected = selectedTileId === tile.id;
+                      const isInactive = !tile.active;
 
-                        <span className="tile-name">
-                          {color.toUpperCase()}
-                        </span>
+                      return (
+                        <button
+                          key={tile.id}
+                          className={`floor-tile floor-${tile.color} ${
+                            isSelected ? "tile-selected" : ""
+                          } ${isInactive ? "tile-inactive" : ""}`}
+                          onClick={() => chooseTile(tile.id)}
+                          disabled={!canChooseTile || isInactive}
+                          aria-label={`Choose tile at row ${tile.row + 1}, column ${tile.column + 1}`}
+                        >
+                          <span className="tile-emoji">
+                            {COLOR_EMOJI[tile.color] || "🟩"}
+                          </span>
 
-                        {selectedTile === color && (
-                          <span className="tile-check">✓ LOCKED</span>
-                        )}
-                      </button>
-                    ))}
+                          <span className="tile-name">
+                            {tile.color.toUpperCase()}
+                          </span>
+
+                          {isSelected && (
+                            <span className="tile-check">✓ LOCKED</span>
+                          )}
+
+                          {isInactive && (
+                            <span className="tile-inactive-label">INACTIVE</span>
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
 
-                  {alreadySelected || selectedTile ? (
+                  {alreadySelected || selectedTileId ? (
                     <div className="floor-status-message">
                       <span className="status-pulse" />
                       Tile locked in! Waiting for the other players...
                     </div>
                   ) : (
                     <p className="floor-hint">
-                      Choose carefully. You cannot change your choice.
+                      Choose carefully from the active arena. You cannot change your choice.
                     </p>
                   )}
 
@@ -771,31 +794,42 @@ export default function App() {
                     )}
                   </div>
 
-                  <div className="tile-grid reveal-grid">
-                    {floorGame.tiles.map((color) => (
-                      <div
-                        key={color}
-                        className={`floor-tile floor-${color} ${
-                          color === floorGame.safe_color
-                            ? "tile-safe"
-                            : "tile-danger"
-                        }`}
-                      >
-                        <span className="tile-emoji">
-                          {COLOR_EMOJI[color]}
-                        </span>
+                  <div
+                    className="tile-grid reveal-grid dynamic-grid"
+                    style={{
+                      gridTemplateColumns: `repeat(${floorGame.arena?.grid_size || 3}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {floorGame.arena?.tiles.map((tile) => {
+                      const isSafe = tile.outcome === "safe" || tile.outcome === "bonus";
 
-                        <span className="tile-name">
-                          {color.toUpperCase()}
-                        </span>
+                      return (
+                        <div
+                          key={tile.id}
+                          className={`floor-tile floor-${tile.color} ${
+                            isSafe ? "tile-safe" : "tile-danger"
+                          }`}
+                        >
+                          <span className="tile-emoji">
+                            {COLOR_EMOJI[tile.color] || "🟩"}
+                          </span>
 
-                        <span className="tile-result">
-                          {color === floorGame.safe_color
-                            ? "✓ SAFE"
-                            : "✕ DANGER"}
-                        </span>
-                      </div>
-                    ))}
+                          <span className="tile-name">
+                            {tile.color.toUpperCase()}
+                          </span>
+
+                          <span className="tile-result">
+                            {tile.outcome === "bonus"
+                              ? "⭐ BONUS"
+                              : tile.outcome === "safe"
+                              ? "✓ SAFE"
+                              : tile.outcome === "trap"
+                              ? "⚠️ TRAP"
+                              : "✕ DANGER"}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
 
                   <div className="round-results">
@@ -815,10 +849,10 @@ export default function App() {
                           </strong>
 
                           <span>
-                            {result.outcome === "safe"
+                            {result.outcome === "safe" || result.outcome === "bonus"
                               ? `Survived on ${result.tile_color}`
-                              : result.outcome === "danger"
-                              ? `Dangerous ${result.tile_color} tile`
+                              : result.outcome === "danger" || result.outcome === "trap"
+                              ? `Dangerous/Trap tile (${result.tile_color || "none"})`
                               : "Didn't choose in time"}
                           </span>
                         </div>
