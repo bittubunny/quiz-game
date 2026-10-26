@@ -29,11 +29,9 @@ app.add_middleware(
 
 MAX_PLAYERS = 4
 
-# Original quiz settings. These are kept for the existing quiz mode.
 QUESTION_TIME = 15
 TOTAL_QUESTIONS = 10
 
-# DON'T TRUST THE FLOOR settings.
 FLOOR_COLORS = ["green", "blue", "red", "yellow"]
 FLOOR_ROUNDS = 10
 FLOOR_DECISION_TIME = 15
@@ -47,14 +45,10 @@ FLOOR_MIN_GRID_SIZE = 3
 FLOOR_MAX_GRID_SIZE = 4
 FLOOR_SPECIAL_TILE_CHANCE = 20
 
-# In-memory rooms are suitable for a small prototype. They are lost when the
-# process restarts and are not shared between multiple server instances.
 rooms = {}
-
 
 # ============================================================
 # ORIGINAL QUIZ QUESTIONS
-# Preserved so the existing quiz endpoints still work.
 # ============================================================
 
 QUESTIONS = [
@@ -130,7 +124,6 @@ QUESTIONS = [
     },
 ]
 
-
 # ============================================================
 # REQUEST MODELS
 # ============================================================
@@ -148,8 +141,6 @@ class AnswerRequest(BaseModel):
 
 
 class FloorChoiceRequest(BaseModel):
-    # tile_color keeps the old four-color frontend compatible.
-    # tile_id enables the new dynamic grid frontend.
     tile_color: Optional[str] = None
     tile_id: Optional[str] = None
 
@@ -160,41 +151,44 @@ class FloorChoiceRequest(BaseModel):
         return self
 
 
+class BetrayalRequest(BaseModel):
+    target_player_id: str
+    message: str = Field(min_length=1, max_length=100)
+
+
+class AuctionBidRequest(BaseModel):
+    bid_amount: int = Field(ge=0)
+
+
 # ============================================================
 # COMMON HELPERS
 # ============================================================
 
 def clean_nickname(nickname: str) -> str:
     nickname = " ".join(nickname.split()).strip()
-
     if not nickname:
         raise HTTPException(
             status_code=400,
             detail="Enter a nickname.",
         )
-
     return nickname[:20]
 
 
 def generate_room_code() -> str:
     characters = string.ascii_uppercase + string.digits
-
     while True:
         code = "".join(secrets.choice(characters) for _ in range(6))
-
         if code not in rooms:
             return code
 
 
 def get_room_or_404(code: str) -> dict:
     room = rooms.get(code.strip().upper())
-
     if not room:
         raise HTTPException(
             status_code=404,
             detail="Room not found.",
         )
-
     advance_game_if_needed(room)
     return room
 
@@ -220,7 +214,7 @@ def authenticate_player(
 
 
 # ============================================================
-# DON'T TRUST THE FLOOR: DYNAMIC ARENA GENERATOR
+# DON'T TRUST THE FLOOR: DYNAMIC ARENA & DECEPTION ENGINE
 # ============================================================
 
 FLOOR_EVENTS = [
@@ -263,21 +257,13 @@ FLOOR_EVENTS = [
 
 
 def choose_floor_event() -> dict:
-    """Return a copy of a randomly selected event description."""
     return dict(secrets.choice(FLOOR_EVENTS))
 
 
-def create_floor_round(round_number: int) -> dict:
-    """Create one server-side round with a randomized 3x3 or 4x4 arena.
-
-    Hidden tile outcomes are never sent to clients until the reveal phase.
-    Existing clients can still choose by color; new clients should choose by
-    the unique tile_id returned in the public arena list.
-    """
+def create_floor_round(round_number: int, total_rounds: int, players: list) -> dict:
     grid_size = secrets.choice([FLOOR_MIN_GRID_SIZE, FLOOR_MAX_GRID_SIZE])
     event = choose_floor_event()
 
-    # A round can be a normal clue round, or the event can force deception.
     announced_color = secrets.choice(FLOOR_COLORS)
     forced_fake_clue = event["id"] == "fake_clue"
     is_trap_clue = forced_fake_clue or (
@@ -295,8 +281,6 @@ def create_floor_round(round_number: int) -> dict:
     safe_tile_ids = []
     tile_outcomes = {}
 
-    # Shrinking rounds use a smaller active area even if the generated board
-    # is 4x4. Other rounds allow every tile to be selected.
     active_size = grid_size
     if event["id"] == "shrinking_arena" and grid_size == 4:
         active_size = 3
@@ -307,8 +291,6 @@ def create_floor_round(round_number: int) -> dict:
             color = secrets.choice(FLOOR_COLORS)
             active = row < active_size and column < active_size
 
-            # Tiles matching the true safe color are normally safe. Some
-            # non-safe tiles can be traps, and one safe tile may be a bonus.
             if color == safe_color:
                 outcome = "safe"
             else:
@@ -330,8 +312,6 @@ def create_floor_round(round_number: int) -> dict:
             if active and outcome == "safe":
                 safe_tile_ids.append(tile_id)
 
-    # Ensure at least one active safe tile exists, even in an unusual random
-    # arrangement. This also makes each round playable and fair.
     if not safe_tile_ids:
         candidates = [tile for tile in tiles if tile["active"]]
         chosen = secrets.choice(candidates)
@@ -339,7 +319,6 @@ def create_floor_round(round_number: int) -> dict:
         tile_outcomes[chosen["id"]] = "safe"
         safe_tile_ids.append(chosen["id"])
 
-    # A bonus tile is safe and is worth more points. It is hidden until reveal.
     bonus_tile_id = None
     if event["id"] == "bonus_tile":
         bonus_candidates = [tile_id for tile_id in safe_tile_ids]
@@ -347,10 +326,37 @@ def create_floor_round(round_number: int) -> dict:
             bonus_tile_id = secrets.choice(bonus_candidates)
             tile_outcomes[bonus_tile_id] = "bonus"
 
-    # Double points applies to all safe outcomes in this round.
     announcement = f"{announced_color.upper()} IS SAFE!"
     if event["id"] == "blackout":
         announcement = "BLACKOUT! THE COLORS WON'T SAVE YOU."
+
+    # --- NEW FEATURE LOGIC ---
+    # 1. Assign Secret Informant to one random player per round
+    informant_player = secrets.choice(players) if players else None
+    informant_secret = None
+    if informant_player:
+        # Generate custom secret mission/clue
+        secret_types = [
+            f"{safe_color.upper()} is safe. Convince others to pick it for bonus points!",
+            f"A danger zone lurks near {announced_color.upper()}. Mislead your opponents!",
+            f"At least one trap tile is active this round. Steer everyone away from it, or into it!",
+        ]
+        informant_secret = secrets.choice(secret_types)
+
+    # 2. Assign Fragmented Info to all players ("Nobody Gets the Whole Truth")
+    fragment_pool = [
+        f"Safe color contains or matches {safe_color}.",
+        "At least one danger tile is a hidden trap.",
+        "The current announcement might be fully deceptive.",
+        "The safest tile on this board contains a high-value bonus.",
+        "Check row positions carefully; edge coordinates hide traps.",
+    ]
+    player_fragments = {}
+    for p in players:
+        player_fragments[p["id"]] = secrets.choice(fragment_pool)
+
+    # 3. Final Round Auction initialization
+    is_final_round = (round_number == total_rounds)
 
     return {
         "round_number": round_number,
@@ -367,6 +373,13 @@ def create_floor_round(round_number: int) -> dict:
         "bonus_tile_id": bonus_tile_id,
         "double_points": event["id"] == "double_points",
         "blackout": event["id"] == "blackout",
+        "informant_player_id": informant_player["id"] if informant_player else None,
+        "informant_secret": informant_secret,
+        "player_fragments": player_fragments,
+        "is_final_round": is_final_round,
+        "auction_bids": {},  # player_id -> bid amount
+        "auction_resolved": False,
+        "auction_hints": {},  # player_id -> hint text
     }
 
 
@@ -379,6 +392,22 @@ def resolve_floor_round(room: dict) -> None:
     round_data = game["rounds"][game["round_index"]]
     results = []
 
+    # Resolve Final Round Auction if applicable
+    if round_data["is_final_round"] and not round_data["auction_resolved"]:
+        round_data["auction_resolved"] = True
+        bids = round_data["auction_bids"]
+        if bids:
+            # Find highest bidder
+            highest_bidder_id = max(bids, key=bids.get)
+            max_bid = bids[highest_bidder_id]
+            # Deduct points from highest bidder
+            for p in room["players"]:
+                if p["id"] == highest_bidder_id:
+                    p["score"] = max(0, p["score"] - max_bid)
+                    # Give private exact hint
+                    round_data["auction_hints"][p["id"]] = f"AUCTION WIN: Safe color is {round_data['safe_color'].upper()}!"
+                    break
+
     for player in room["players"]:
         choice = game["choices"].get(player["id"])
 
@@ -387,7 +416,6 @@ def resolve_floor_round(room: dict) -> None:
             points = 0
             chosen_tile_id = None
             chosen_color = None
-
         else:
             chosen_tile_id = choice["tile_id"]
             chosen_color = choice["tile_color"]
@@ -408,6 +436,19 @@ def resolve_floor_round(room: dict) -> None:
                 outcome = tile_outcome
                 points = -FLOOR_DANGER_PENALTY
                 player["score"] += points
+
+        # Check Betrayal outcome points settlement
+        # If player was targeted by a betrayal and failed, sender gets bonus
+        betrayals = game.get("betrayals", {})
+        for sender_id, target_data in betrayals.items():
+            if target_data.get("target_id") == player["id"] and not target_data.get("settled"):
+                target_data["settled"] = True
+                if outcome in ("danger", "trap", "timeout"):
+                    # Target failed! Reward sender
+                    for p in room["players"]:
+                        if p["id"] == sender_id:
+                            p["score"] += 75  # Bonus reward for successful betrayal
+                            break
 
         results.append({
             "player_id": player["id"],
@@ -454,10 +495,10 @@ def advance_floor_game_if_needed(room: dict) -> None:
             game["phase_started_at"] = now
             game["choices"] = {}
             game["results"] = []
+            # Reset round specific ephemeral action states like chat reactions/betrayals flags if needed
 
 
 def public_floor_tile(tile: dict, round_data: dict, reveal: bool) -> dict:
-    """Build a tile payload that does not leak hidden outcomes before reveal."""
     result = {
         "id": tile["id"],
         "color": "hidden" if round_data["blackout"] and not reveal else tile["color"],
@@ -504,10 +545,9 @@ def advance_game_if_needed(room: dict) -> None:
 
 # ============================================================
 # PUBLIC ROOM STATE
-# Never expose session tokens or hidden safe colors.
 # ============================================================
 
-def public_room_state(room: dict) -> dict:
+def public_room_state(room: dict, current_player_id: Optional[str] = None) -> dict:
     advance_game_if_needed(room)
 
     players = [
@@ -517,6 +557,7 @@ def public_room_state(room: dict) -> dict:
             "is_host": player["is_host"],
             "ready": player["ready"],
             "score": player["score"],
+            "has_used_betrayal": player.get("has_used_betrayal", False),
         }
         for player in room["players"]
     ]
@@ -555,9 +596,7 @@ def public_room_state(room: dict) -> dict:
                     else 0
                 ),
                 "announcement": round_data["announcement"],
-                # Legacy four-color list retained for older clients.
                 "tiles": FLOOR_COLORS,
-                # New dynamic board data for the updated frontend.
                 "arena": {
                     "grid_size": round_data["grid_size"],
                     "active_size": round_data["active_size"],
@@ -570,10 +609,31 @@ def public_room_state(room: dict) -> dict:
                 "double_points": round_data["double_points"],
                 "blackout": round_data["blackout"],
                 "selected_player_ids": list(game["choices"].keys()),
+                "is_final_round": round_data["is_final_round"],
             }
 
-            # Only reveal hidden tile outcomes and the true safe color after
-            # the choosing phase has ended.
+            # Personal/Private payloads for the current authenticated client
+            if current_player_id:
+                # Secret Informant check
+                if round_data["informant_player_id"] == current_player_id:
+                    floor_state["secret_mission"] = round_data["informant_secret"]
+                else:
+                    floor_state["secret_mission"] = None
+
+                # Fragmented clue
+                floor_state["my_fragment"] = round_data["player_fragments"].get(current_player_id, "")
+
+                # Incoming Betrayal messages
+                inbox = game.get("inbox", {}).get(current_player_id, [])
+                floor_state["inbox"] = inbox
+
+                # Auction hint if won
+                if round_data["auction_hints"].get(current_player_id):
+                    floor_state["auction_hint"] = round_data["auction_hints"][current_player_id]
+
+            # Public reactions feed
+            floor_state["reactions"] = game.get("reactions", [])
+
             if reveal:
                 floor_state["safe_color"] = round_data["safe_color"]
                 floor_state["announced_color"] = round_data["announced_color"]
@@ -632,7 +692,7 @@ def public_room_state(room: dict) -> dict:
 @app.get("/")
 def home():
     return {
-        "message": "DON'T TRUST THE FLOOR API is running!"
+        "message": "DON'T TRUST THE FLOOR API is running with Deception & Social Mechanics!"
     }
 
 
@@ -660,6 +720,7 @@ def create_room(request: NicknameRequest):
         "ready": False,
         "score": 0,
         "session_token": secrets.token_urlsafe(32),
+        "has_used_betrayal": False,
     }
 
     room = {
@@ -668,22 +729,18 @@ def create_room(request: NicknameRequest):
         "status": "lobby",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "players": [host],
-
-        # Original quiz state.
         "game_mode": "quiz",
         "questions": [],
         "question_index": 0,
         "question_started_at": 0,
         "answers": {},
-
-        # Tile game state.
         "floor_game": None,
     }
 
     rooms[code] = room
 
     return {
-        "room": public_room_state(room),
+        "room": public_room_state(room, host["id"]),
         "player_id": host["id"],
         "session_token": host["session_token"],
     }
@@ -716,12 +773,13 @@ def join_room(code: str, request: NicknameRequest):
         "ready": False,
         "score": 0,
         "session_token": secrets.token_urlsafe(32),
+        "has_used_betrayal": False,
     }
 
     room["players"].append(player)
 
     return {
-        "room": public_room_state(room),
+        "room": public_room_state(room, player["id"]),
         "player_id": player["id"],
         "session_token": player["session_token"],
     }
@@ -732,8 +790,19 @@ def join_room(code: str, request: NicknameRequest):
 # ============================================================
 
 @app.get("/rooms/{code}")
-def get_room(code: str):
-    return public_room_state(get_room_or_404(code))
+def get_room(
+    code: str,
+    x_session_token: Optional[str] = Header(default=None),
+):
+    room = get_room_or_404(code)
+    player = None
+    if x_session_token:
+        try:
+            player = authenticate_player(room, x_session_token)
+        except HTTPException:
+            pass
+    player_id = player["id"] if player else None
+    return public_room_state(room, player_id)
 
 
 # ============================================================
@@ -759,132 +828,7 @@ def set_ready(
 
     return {
         "message": "Ready status updated.",
-        "room": public_room_state(room),
-    }
-
-
-# ============================================================
-# ORIGINAL QUIZ START
-# ============================================================
-
-@app.post("/rooms/{code}/start")
-def start_game(
-    code: str,
-    x_session_token: Optional[str] = Header(default=None),
-):
-    room = get_room_or_404(code)
-    player = authenticate_player(room, x_session_token)
-
-    if player["id"] != room["host_id"]:
-        raise HTTPException(
-            status_code=403,
-            detail="Only the host can start.",
-        )
-
-    if room["status"] != "lobby":
-        raise HTTPException(
-            status_code=400,
-            detail="Game already started.",
-        )
-
-    if len(room["players"]) < 2:
-        raise HTTPException(
-            status_code=400,
-            detail="Need at least 2 players.",
-        )
-
-    if not all(p["ready"] for p in room["players"]):
-        raise HTTPException(
-            status_code=400,
-            detail="Everyone must be ready.",
-        )
-
-    room["questions"] = secrets.SystemRandom().sample(
-        QUESTIONS,
-        k=min(TOTAL_QUESTIONS, len(QUESTIONS)),
-    )
-
-    room["question_index"] = 0
-    room["question_started_at"] = time.time()
-    room["answers"] = {}
-    room["game_mode"] = "quiz"
-    room["floor_game"] = None
-
-    for player_in_room in room["players"]:
-        player_in_room["score"] = 0
-
-    room["status"] = "playing"
-
-    return {
-        "message": "Game started!",
-        "room": public_room_state(room),
-    }
-
-
-# ============================================================
-# ORIGINAL QUIZ ANSWER
-# ============================================================
-
-@app.post("/rooms/{code}/answer")
-def submit_answer(
-    code: str,
-    request: AnswerRequest,
-    x_session_token: Optional[str] = Header(default=None),
-):
-    room = get_room_or_404(code)
-    player = authenticate_player(room, x_session_token)
-
-    if room.get("game_mode") == "floor":
-        raise HTTPException(
-            status_code=400,
-            detail="This room is playing DON'T TRUST THE FLOOR.",
-        )
-
-    if room["status"] != "playing":
-        raise HTTPException(
-            status_code=400,
-            detail="No active question.",
-        )
-
-    if player["id"] in room["answers"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Already answered this question.",
-        )
-
-    question = room["questions"][room["question_index"]]
-    elapsed = time.time() - room["question_started_at"]
-
-    if elapsed >= QUESTION_TIME:
-        advance_game_if_needed(room)
-        raise HTTPException(
-            status_code=400,
-            detail="Time is up.",
-        )
-
-    correct = request.answer_index == question["correct"]
-    points = 0
-
-    if correct:
-        points = max(
-            500,
-            round(1000 * (1 - elapsed / QUESTION_TIME)),
-        )
-        player["score"] += points
-
-    room["answers"][player["id"]] = {
-        "answer_index": request.answer_index,
-        "correct": correct,
-        "points": points,
-    }
-
-    advance_game_if_needed(room)
-
-    return {
-        "message": "Answer submitted.",
-        "correct": correct,
-        "points_earned": points,
-        "room": public_room_state(room),
+        "room": public_room_state(room, player["id"]),
     }
 
 
@@ -926,6 +870,7 @@ def start_floor_game(
 
     for player_in_room in room["players"]:
         player_in_room["score"] = 0
+        player_in_room["has_used_betrayal"] = False
 
     room["game_mode"] = "floor"
     room["questions"] = []
@@ -935,7 +880,7 @@ def start_floor_game(
 
     room["floor_game"] = {
         "rounds": [
-            create_floor_round(round_number=index + 1)
+            create_floor_round(round_number=index + 1, total_rounds=FLOOR_ROUNDS, players=room["players"])
             for index in range(FLOOR_ROUNDS)
         ],
         "round_index": 0,
@@ -943,19 +888,137 @@ def start_floor_game(
         "phase_started_at": time.time(),
         "choices": {},
         "results": [],
+        "reactions": [],
+        "betrayals": {},  # sender_id -> {target_id, message, settled}
+        "inbox": {},      # player_id -> [messages]
     }
 
     room["status"] = "playing"
 
     return {
         "message": "DON'T TRUST THE FLOOR has started!",
-        "room": public_room_state(room),
+        "room": public_room_state(room, player["id"]),
     }
 
 
 # ============================================================
+# SOCIAL MECHANICS ENDPOINTS (Reactions, Betrayal, Auction)
+# ============================================================
+
+class ReactionRequest(BaseModel):
+    emoji: str = Field(min_length=1, max_length=10)
+    text: str = Field(min_length=1, max_length=50)
+
+
+@app.post("/rooms/{code}/floor/react")
+def send_reaction(
+    code: str,
+    request: ReactionRequest,
+    x_session_token: Optional[str] = Header(default=None),
+):
+    room = get_room_or_404(code)
+    player = authenticate_player(room, x_session_token)
+    game = room.get("floor_game")
+
+    if not game or room["status"] != "playing":
+        raise HTTPException(status_code=400, detail="Floor game not active.")
+
+    reaction = {
+        "player_id": player["id"],
+        "nickname": player["nickname"],
+        "emoji": request.emoji,
+        "text": request.text,
+        "timestamp": time.time(),
+    }
+
+    if "reactions" not in game:
+        game["reactions"] = []
+
+    game["reactions"].append(reaction)
+    # Keep only last 10 reactions to prevent bloat
+    if len(game["reactions"]) > 10:
+        game["reactions"] = game["reactions"][-10:]
+
+    return {"message": "Reaction sent", "room": public_room_state(room, player["id"])}
+
+
+@app.post("/rooms/{code}/floor/betray")
+def use_betrayal(
+    code: str,
+    request: BetrayalRequest,
+    x_session_token: Optional[str] = Header(default=None),
+):
+    room = get_room_or_404(code)
+    player = authenticate_player(room, x_session_token)
+    game = room.get("floor_game")
+
+    if not game or room["status"] != "playing":
+        raise HTTPException(status_code=400, detail="Floor game not active.")
+
+    if player.get("has_used_betrayal", False):
+        raise HTTPException(status_code=400, detail="You have already used your Betrayal Button this match!")
+
+    if player["id"] == request.target_player_id:
+        raise HTTPException(status_code=400, detail="You cannot betray yourself.")
+
+    target_exists = any(p["id"] == request.target_player_id for p in room["players"])
+    if not target_exists:
+        raise HTTPException(status_code=404, detail="Target player not found.")
+
+    player["has_used_betrayal"] = True
+
+    if "betrayals" not in game:
+        game["betrayals"] = {}
+    if "inbox" not in game:
+        game["inbox"] = {}
+
+    game["betrayals"][player["id"]] = {
+        "target_id": request.target_player_id,
+        "message": request.message,
+        "settled": False,
+    }
+
+    if request.target_player_id not in game["inbox"]:
+        game["inbox"][request.target_player_id] = []
+
+    game["inbox"][request.target_player_id].append({
+        "sender_name": "Anonymous Rival",
+        "message": request.message,
+    })
+
+    return {"message": "Secret message dispatched successfully!", "room": public_room_state(room, player["id"])}
+
+
+@app.post("/rooms/{code}/floor/auction")
+def place_auction_bid(
+    code: str,
+    request: AuctionBidRequest,
+    x_session_token: Optional[str] = Header(default=None),
+):
+    room = get_room_or_404(code)
+    player = authenticate_player(room, x_session_token)
+    game = room.get("floor_game")
+
+    if not game or room["status"] != "playing":
+        raise HTTPException(status_code=400, detail="Floor game not active.")
+
+    round_data = game["rounds"][game["round_index"]]
+    if not round_data["is_final_round"]:
+        raise HTTPException(status_code=400, detail="The Truth Auction only occurs in the final round.")
+
+    if round_data["auction_resolved"]:
+        raise HTTPException(status_code=400, detail="Auction has already concluded for this round.")
+
+    if player["score"] < request.bid_amount:
+        raise HTTPException(status_code=400, detail="You do not have enough points for this bid.")
+
+    round_data["auction_bids"][player["id"]] = request.bid_amount
+
+    return {"message": "Bid recorded!", "room": public_room_state(room, player["id"])}
+
+
+# ============================================================
 # DON'T TRUST THE FLOOR: SELECT A TILE
-# Supports new tile_id choices and old tile_color choices.
 # ============================================================
 
 @app.post("/rooms/{code}/floor/choose")
@@ -980,8 +1043,6 @@ def choose_floor_tile(
         )
 
     game = room["floor_game"]
-
-    # Advance expired phases before accepting a choice.
     advance_floor_game_if_needed(room)
 
     if room["status"] != "playing":
@@ -1023,8 +1084,6 @@ def choose_floor_tile(
                 detail="Invalid tile_id for this arena.",
             )
     else:
-        # Legacy behavior: a color selection chooses the first active tile of
-        # that color. The old frontend can continue sending tile_color.
         tile_color = request.tile_color.strip().lower()
         if tile_color not in FLOOR_COLORS:
             raise HTTPException(
@@ -1057,5 +1116,5 @@ def choose_floor_tile(
 
     return {
         "message": "Tile locked in!",
-        "room": public_room_state(room),
+        "room": public_room_state(room, player["id"]),
     }
