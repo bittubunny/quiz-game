@@ -1,12 +1,12 @@
-
 import secrets
 import string
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 app = FastAPI(title="DON'T TRUST THE FLOOR API")
@@ -29,11 +29,11 @@ app.add_middleware(
 
 MAX_PLAYERS = 4
 
-# Original quiz settings
+# Original quiz settings. These are kept for the existing quiz mode.
 QUESTION_TIME = 15
 TOTAL_QUESTIONS = 10
 
-# DON'T TRUST THE FLOOR settings
+# DON'T TRUST THE FLOOR settings.
 FLOOR_COLORS = ["green", "blue", "red", "yellow"]
 FLOOR_ROUNDS = 10
 FLOOR_DECISION_TIME = 15
@@ -41,7 +41,14 @@ FLOOR_REVEAL_TIME = 4
 FLOOR_SAFE_POINTS = 100
 FLOOR_DANGER_PENALTY = 25
 FLOOR_TRAP_CHANCE = 30
+FLOOR_BONUS_POINTS = 150
+FLOOR_DOUBLE_POINTS = 2
+FLOOR_MIN_GRID_SIZE = 3
+FLOOR_MAX_GRID_SIZE = 4
+FLOOR_SPECIAL_TILE_CHANCE = 20
 
+# In-memory rooms are suitable for a small prototype. They are lost when the
+# process restarts and are not shared between multiple server instances.
 rooms = {}
 
 
@@ -141,7 +148,16 @@ class AnswerRequest(BaseModel):
 
 
 class FloorChoiceRequest(BaseModel):
-    tile_color: str
+    # tile_color keeps the old four-color frontend compatible.
+    # tile_id enables the new dynamic grid frontend.
+    tile_color: Optional[str] = None
+    tile_id: Optional[str] = None
+
+    @model_validator(mode="after")
+    def require_a_tile_choice(self):
+        if not self.tile_color and not self.tile_id:
+            raise ValueError("Provide either tile_id or tile_color.")
+        return self
 
 
 # ============================================================
@@ -164,9 +180,7 @@ def generate_room_code() -> str:
     characters = string.ascii_uppercase + string.digits
 
     while True:
-        code = "".join(
-            secrets.choice(characters) for _ in range(6)
-        )
+        code = "".join(secrets.choice(characters) for _ in range(6))
 
         if code not in rooms:
             return code
@@ -187,7 +201,7 @@ def get_room_or_404(code: str) -> dict:
 
 def authenticate_player(
     room: dict,
-    session_token: str | None,
+    session_token: Optional[str],
 ) -> dict:
     if not session_token:
         raise HTTPException(
@@ -196,10 +210,7 @@ def authenticate_player(
         )
 
     for player in room["players"]:
-        if secrets.compare_digest(
-            player["session_token"],
-            session_token,
-        ):
+        if secrets.compare_digest(player["session_token"], session_token):
             return player
 
     raise HTTPException(
@@ -209,29 +220,153 @@ def authenticate_player(
 
 
 # ============================================================
-# DON'T TRUST THE FLOOR: ROUND ENGINE
+# DON'T TRUST THE FLOOR: DYNAMIC ARENA GENERATOR
 # ============================================================
 
-def create_floor_round() -> dict:
+FLOOR_EVENTS = [
+    {
+        "id": "color_clue",
+        "name": "Trust Issues",
+        "description": "A color is announced. It might be telling the truth.",
+    },
+    {
+        "id": "fake_clue",
+        "name": "False Promise",
+        "description": "The announcement is guaranteed to be misleading this round.",
+    },
+    {
+        "id": "bonus_tile",
+        "name": "Golden Opportunity",
+        "description": "A hidden bonus tile can award extra points.",
+    },
+    {
+        "id": "trap_tiles",
+        "name": "Trap Floor",
+        "description": "Some tiles are dangerous even when the clue seems convincing.",
+    },
+    {
+        "id": "shrinking_arena",
+        "name": "Shrinking Arena",
+        "description": "Only the highlighted active area can be selected.",
+    },
+    {
+        "id": "blackout",
+        "name": "Color Blackout",
+        "description": "Tile colors are hidden; use the tile positions and clue carefully.",
+    },
+    {
+        "id": "double_points",
+        "name": "Double or Nothing",
+        "description": "Safe tiles award double points this round.",
+    },
+]
+
+
+def choose_floor_event() -> dict:
+    """Return a copy of a randomly selected event description."""
+    return dict(secrets.choice(FLOOR_EVENTS))
+
+
+def create_floor_round(round_number: int) -> dict:
+    """Create one server-side round with a randomized 3x3 or 4x4 arena.
+
+    Hidden tile outcomes are never sent to clients until the reveal phase.
+    Existing clients can still choose by color; new clients should choose by
+    the unique tile_id returned in the public arena list.
+    """
+    grid_size = secrets.choice([FLOOR_MIN_GRID_SIZE, FLOOR_MAX_GRID_SIZE])
+    event = choose_floor_event()
+
+    # A round can be a normal clue round, or the event can force deception.
     announced_color = secrets.choice(FLOOR_COLORS)
+    forced_fake_clue = event["id"] == "fake_clue"
+    is_trap_clue = forced_fake_clue or (
+        secrets.randbelow(100) < FLOOR_TRAP_CHANCE
+    )
 
-    # 30% of announcements are misleading.
-    is_trap = secrets.randbelow(100) < FLOOR_TRAP_CHANCE
-
-    if is_trap:
+    if is_trap_clue:
         safe_color = secrets.choice([
-            color
-            for color in FLOOR_COLORS
-            if color != announced_color
+            color for color in FLOOR_COLORS if color != announced_color
         ])
     else:
         safe_color = announced_color
 
+    tiles = []
+    safe_tile_ids = []
+    tile_outcomes = {}
+
+    # Shrinking rounds use a smaller active area even if the generated board
+    # is 4x4. Other rounds allow every tile to be selected.
+    active_size = grid_size
+    if event["id"] == "shrinking_arena" and grid_size == 4:
+        active_size = 3
+
+    for row in range(grid_size):
+        for column in range(grid_size):
+            tile_id = f"r{row + 1}c{column + 1}"
+            color = secrets.choice(FLOOR_COLORS)
+            active = row < active_size and column < active_size
+
+            # Tiles matching the true safe color are normally safe. Some
+            # non-safe tiles can be traps, and one safe tile may be a bonus.
+            if color == safe_color:
+                outcome = "safe"
+            else:
+                outcome = "danger"
+
+            if active and color != safe_color:
+                if secrets.randbelow(100) < FLOOR_SPECIAL_TILE_CHANCE:
+                    outcome = "trap"
+
+            tiles.append({
+                "id": tile_id,
+                "color": color,
+                "row": row,
+                "column": column,
+                "active": active,
+            })
+            tile_outcomes[tile_id] = outcome
+
+            if active and outcome == "safe":
+                safe_tile_ids.append(tile_id)
+
+    # Ensure at least one active safe tile exists, even in an unusual random
+    # arrangement. This also makes each round playable and fair.
+    if not safe_tile_ids:
+        candidates = [tile for tile in tiles if tile["active"]]
+        chosen = secrets.choice(candidates)
+        chosen["color"] = safe_color
+        tile_outcomes[chosen["id"]] = "safe"
+        safe_tile_ids.append(chosen["id"])
+
+    # A bonus tile is safe and is worth more points. It is hidden until reveal.
+    bonus_tile_id = None
+    if event["id"] == "bonus_tile":
+        bonus_candidates = [tile_id for tile_id in safe_tile_ids]
+        if bonus_candidates:
+            bonus_tile_id = secrets.choice(bonus_candidates)
+            tile_outcomes[bonus_tile_id] = "bonus"
+
+    # Double points applies to all safe outcomes in this round.
+    announcement = f"{announced_color.upper()} IS SAFE!"
+    if event["id"] == "blackout":
+        announcement = "BLACKOUT! THE COLORS WON'T SAVE YOU."
+
     return {
-        "announcement": f"{announced_color.upper()} IS SAFE!",
+        "round_number": round_number,
+        "grid_size": grid_size,
+        "active_size": active_size,
+        "event": event,
+        "announcement": announcement,
         "announced_color": announced_color,
         "safe_color": safe_color,
-        "is_trap": is_trap,
+        "is_trap": is_trap_clue,
+        "tiles": tiles,
+        "tile_outcomes": tile_outcomes,
+        "safe_tile_ids": safe_tile_ids,
+        "bonus_tile_id": bonus_tile_id,
+        "double_points": event["id"] == "double_points",
+        "blackout": event["id"] == "blackout",
     }
 
 
@@ -245,25 +380,39 @@ def resolve_floor_round(room: dict) -> None:
     results = []
 
     for player in room["players"]:
-        chosen_color = game["choices"].get(player["id"])
+        choice = game["choices"].get(player["id"])
 
-        if chosen_color is None:
+        if choice is None:
             outcome = "timeout"
             points = 0
-
-        elif chosen_color == round_data["safe_color"]:
-            outcome = "safe"
-            points = FLOOR_SAFE_POINTS
-            player["score"] += points
+            chosen_tile_id = None
+            chosen_color = None
 
         else:
-            outcome = "danger"
-            points = -FLOOR_DANGER_PENALTY
-            player["score"] += points
+            chosen_tile_id = choice["tile_id"]
+            chosen_color = choice["tile_color"]
+            tile_outcome = round_data["tile_outcomes"].get(chosen_tile_id, "danger")
+
+            if tile_outcome in ("safe", "bonus"):
+                outcome = tile_outcome
+                points = FLOOR_SAFE_POINTS
+
+                if round_data["double_points"]:
+                    points *= FLOOR_DOUBLE_POINTS
+
+                if tile_outcome == "bonus":
+                    points += FLOOR_BONUS_POINTS
+
+                player["score"] += points
+            else:
+                outcome = tile_outcome
+                points = -FLOOR_DANGER_PENALTY
+                player["score"] += points
 
         results.append({
             "player_id": player["id"],
             "nickname": player["nickname"],
+            "tile_id": chosen_tile_id,
             "tile_color": chosen_color,
             "outcome": outcome,
             "points_earned": points,
@@ -285,10 +434,7 @@ def advance_floor_game_if_needed(room: dict) -> None:
 
     if game["phase"] == "choosing":
         elapsed = now - game["phase_started_at"]
-
-        everyone_chose = (
-            len(game["choices"]) >= len(room["players"])
-        )
+        everyone_chose = len(game["choices"]) >= len(room["players"])
 
         if everyone_chose or elapsed >= FLOOR_DECISION_TIME:
             resolve_floor_round(room)
@@ -310,6 +456,22 @@ def advance_floor_game_if_needed(room: dict) -> None:
             game["results"] = []
 
 
+def public_floor_tile(tile: dict, round_data: dict, reveal: bool) -> dict:
+    """Build a tile payload that does not leak hidden outcomes before reveal."""
+    result = {
+        "id": tile["id"],
+        "color": "hidden" if round_data["blackout"] and not reveal else tile["color"],
+        "row": tile["row"],
+        "column": tile["column"],
+        "active": tile["active"],
+    }
+
+    if reveal:
+        result["outcome"] = round_data["tile_outcomes"].get(tile["id"], "danger")
+
+    return result
+
+
 # ============================================================
 # ORIGINAL QUIZ ENGINE
 # ============================================================
@@ -319,9 +481,7 @@ def advance_quiz_if_needed(room: dict) -> None:
         return
 
     elapsed = time.time() - room["question_started_at"]
-    all_answered = (
-        len(room["answers"]) >= len(room["players"])
-    )
+    all_answered = len(room["answers"]) >= len(room["players"])
 
     if elapsed >= QUESTION_TIME or all_answered:
         next_index = room["question_index"] + 1
@@ -329,7 +489,6 @@ def advance_quiz_if_needed(room: dict) -> None:
         if next_index >= len(room["questions"]):
             room["status"] = "completed"
             room["answers"] = {}
-
         else:
             room["question_index"] = next_index
             room["question_started_at"] = time.time()
@@ -379,6 +538,7 @@ def public_room_state(room: dict) -> dict:
 
         if room["status"] == "playing":
             round_data = game["rounds"][game["round_index"]]
+            reveal = game["phase"] == "reveal"
 
             floor_state = {
                 "round_number": game["round_index"] + 1,
@@ -395,16 +555,31 @@ def public_room_state(room: dict) -> dict:
                     else 0
                 ),
                 "announcement": round_data["announcement"],
+                # Legacy four-color list retained for older clients.
                 "tiles": FLOOR_COLORS,
-                "selected_player_ids": list(
-                    game["choices"].keys()
-                ),
+                # New dynamic board data for the updated frontend.
+                "arena": {
+                    "grid_size": round_data["grid_size"],
+                    "active_size": round_data["active_size"],
+                    "tiles": [
+                        public_floor_tile(tile, round_data, reveal)
+                        for tile in round_data["tiles"]
+                    ],
+                },
+                "event": round_data["event"],
+                "double_points": round_data["double_points"],
+                "blackout": round_data["blackout"],
+                "selected_player_ids": list(game["choices"].keys()),
             }
 
-            # Hidden answers are revealed only during the reveal phase.
-            if game["phase"] == "reveal":
+            # Only reveal hidden tile outcomes and the true safe color after
+            # the choosing phase has ended.
+            if reveal:
                 floor_state["safe_color"] = round_data["safe_color"]
+                floor_state["announced_color"] = round_data["announced_color"]
                 floor_state["is_trap"] = round_data["is_trap"]
+                floor_state["safe_tile_ids"] = round_data["safe_tile_ids"]
+                floor_state["bonus_tile_id"] = round_data["bonus_tile_id"]
                 floor_state["results"] = game["results"]
 
             result["floor_game"] = floor_state
@@ -426,12 +601,9 @@ def public_room_state(room: dict) -> dict:
 
         if room["status"] == "playing":
             question = room["questions"][room["question_index"]]
-
             remaining = max(
                 0,
-                QUESTION_TIME - int(
-                    time.time() - room["question_started_at"]
-                ),
+                QUESTION_TIME - int(time.time() - room["question_started_at"]),
             )
 
             result["question"] = {
@@ -441,9 +613,7 @@ def public_room_state(room: dict) -> dict:
                 "remaining_seconds": remaining,
             }
 
-            result["answered_player_ids"] = list(
-                room["answers"].keys()
-            )
+            result["answered_player_ids"] = list(room["answers"].keys())
 
     if room["status"] == "completed":
         result["final_results"] = sorted(
@@ -499,14 +669,14 @@ def create_room(request: NicknameRequest):
         "created_at": datetime.now(timezone.utc).isoformat(),
         "players": [host],
 
-        # Original quiz state
+        # Original quiz state.
         "game_mode": "quiz",
         "questions": [],
         "question_index": 0,
         "question_started_at": 0,
         "answers": {},
 
-        # Tile game state
+        # Tile game state.
         "floor_game": None,
     }
 
@@ -574,7 +744,7 @@ def get_room(code: str):
 def set_ready(
     code: str,
     request: ReadyRequest,
-    x_session_token: str | None = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
 ):
     room = get_room_or_404(code)
     player = authenticate_player(room, x_session_token)
@@ -600,7 +770,7 @@ def set_ready(
 @app.post("/rooms/{code}/start")
 def start_game(
     code: str,
-    x_session_token: str | None = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
 ):
     room = get_room_or_404(code)
     player = authenticate_player(room, x_session_token)
@@ -640,8 +810,8 @@ def start_game(
     room["game_mode"] = "quiz"
     room["floor_game"] = None
 
-    for p in room["players"]:
-        p["score"] = 0
+    for player_in_room in room["players"]:
+        player_in_room["score"] = 0
 
     room["status"] = "playing"
 
@@ -659,7 +829,7 @@ def start_game(
 def submit_answer(
     code: str,
     request: AnswerRequest,
-    x_session_token: str | None = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
 ):
     room = get_room_or_404(code)
     player = authenticate_player(room, x_session_token)
@@ -687,14 +857,12 @@ def submit_answer(
 
     if elapsed >= QUESTION_TIME:
         advance_game_if_needed(room)
-
         raise HTTPException(
             status_code=400,
             detail="Time is up.",
         )
 
     correct = request.answer_index == question["correct"]
-
     points = 0
 
     if correct:
@@ -727,7 +895,7 @@ def submit_answer(
 @app.post("/rooms/{code}/floor/start")
 def start_floor_game(
     code: str,
-    x_session_token: str | None = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
 ):
     room = get_room_or_404(code)
     player = authenticate_player(room, x_session_token)
@@ -756,8 +924,8 @@ def start_floor_game(
             detail="Everyone must be ready.",
         )
 
-    for p in room["players"]:
-        p["score"] = 0
+    for player_in_room in room["players"]:
+        player_in_room["score"] = 0
 
     room["game_mode"] = "floor"
     room["questions"] = []
@@ -767,8 +935,8 @@ def start_floor_game(
 
     room["floor_game"] = {
         "rounds": [
-            create_floor_round()
-            for _ in range(FLOOR_ROUNDS)
+            create_floor_round(round_number=index + 1)
+            for index in range(FLOOR_ROUNDS)
         ],
         "round_index": 0,
         "phase": "choosing",
@@ -787,13 +955,14 @@ def start_floor_game(
 
 # ============================================================
 # DON'T TRUST THE FLOOR: SELECT A TILE
+# Supports new tile_id choices and old tile_color choices.
 # ============================================================
 
 @app.post("/rooms/{code}/floor/choose")
 def choose_floor_tile(
     code: str,
     request: FloorChoiceRequest,
-    x_session_token: str | None = Header(default=None),
+    x_session_token: Optional[str] = Header(default=None),
 ):
     room = get_room_or_404(code)
     player = authenticate_player(room, x_session_token)
@@ -827,34 +996,64 @@ def choose_floor_tile(
             detail="The reveal has already started.",
         )
 
-    tile_color = request.tile_color.strip().lower()
-
-    if tile_color not in FLOOR_COLORS:
-        raise HTTPException(
-            status_code=422,
-            detail="Choose a valid tile color.",
-        )
-
     if player["id"] in game["choices"]:
         raise HTTPException(
             status_code=409,
             detail="Your tile is already locked in.",
         )
 
-    if (
-        time.time() - game["phase_started_at"]
-        >= FLOOR_DECISION_TIME
-    ):
+    if time.time() - game["phase_started_at"] >= FLOOR_DECISION_TIME:
         advance_floor_game_if_needed(room)
-
         raise HTTPException(
             status_code=400,
             detail="Time is up. Wait for the reveal.",
         )
 
-    game["choices"][player["id"]] = tile_color
+    round_data = game["rounds"][game["round_index"]]
+    selected_tile = None
 
-    advance_floor_game_if_needed(room)
+    if request.tile_id:
+        selected_tile = next(
+            (tile for tile in round_data["tiles"] if tile["id"] == request.tile_id),
+            None,
+        )
+        if selected_tile is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid tile_id for this arena.",
+            )
+    else:
+        # Legacy behavior: a color selection chooses the first active tile of
+        # that color. The old frontend can continue sending tile_color.
+        tile_color = request.tile_color.strip().lower()
+        if tile_color not in FLOOR_COLORS:
+            raise HTTPException(
+                status_code=422,
+                detail="Choose a valid tile color.",
+            )
+        color_matches = [
+            tile for tile in round_data["tiles"]
+            if tile["active"] and tile["color"] == tile_color
+        ]
+        if not color_matches:
+            raise HTTPException(
+                status_code=422,
+                detail="No active tile has that color. Choose another color.",
+            )
+        selected_tile = secrets.choice(color_matches)
+
+    if not selected_tile["active"]:
+        raise HTTPException(
+            status_code=422,
+            detail="That tile is outside the active arena.",
+        )
+
+    game["choices"][player["id"]] = {
+        "tile_id": selected_tile["id"],
+        "tile_color": selected_tile["color"],
+    }
+
+    advance_game_if_needed(room)
 
     return {
         "message": "Tile locked in!",
